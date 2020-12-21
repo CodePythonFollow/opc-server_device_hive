@@ -1,0 +1,8 @@
+{
+  "ip": "it-hao4-dong",
+  "port": "4840",
+  "nodes": {
+    "1": "ns=1;s=the.answer",
+    "2": "ns=1;i=51034"
+  }
+}
