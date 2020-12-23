@@ -4,6 +4,8 @@ import os
 import threading
 import time
 from enum import Enum
+
+import requests
 from devicehive import Handler, DeviceHiveApi, DeviceHive
 from opcua import Client, ua
 from opcua.client.ua_client import UASocketClient
@@ -44,7 +46,7 @@ class OPCScript(UASocketClient):
             # 1、维护一个消息队列，这里发送一个消息让devicehive进行处理
             need_send_to_device_hive.append(msg)
 
-    node_names = ''
+    node_names = dict()
     sub = ''
     connect_status = Status.WAIT_CONNECT
     config_status = Status.CONFIG_NOT_CHANGE
@@ -145,7 +147,6 @@ class OPCScript(UASocketClient):
                     }
                 }
                 need_send_to_device_hive.append(msg)
-                connect_status = Status.FAILED
                 OPCScript.connect_status = Status.FAILED
         else:
             OPCScript.connect_status = Status.FAILED
@@ -154,6 +155,8 @@ class OPCScript(UASocketClient):
     def unsubscribe_nodes(self):
         try:
             OPCScript.sub.unsubscribe(self.handler)
+            OPCScript.client.reconciliate_subscription(self.handler)
+            OPCScript.client.disconnect()
         except Exception as e:
             if 'str' in str(e):
                 print("还未订阅节点")
@@ -250,7 +253,6 @@ class Device:
         # 订阅含有update的语句
         def handle_connect(self):
             self.device = self.api.put_device(self._device_id)
-
             self.device.subscribe_insert_commands([self._accept_command_name])
             # self._device.subscribe_notifications()
 
@@ -263,20 +265,69 @@ class Device:
         self.rest_url = rest_url
         self.login = login
         self.password = password
-        self.device_hive_api = DeviceHiveApi(self.rest_url, login=self.login, password=self.password)
+        self.device_hive_api = DeviceHiveApi(self.rest_url, login=self.login, password=self.password,
+                                             transport_keep_alive=False)
+
+    # 获取token
+    def get_token(self):
+        url = "http://10.159.44.180/auth/rest/token"
+        headers = {
+            "Content-type": "application/json"
+        }
+        data = {
+            "login": self.login,
+            "password": self.password
+        }
+        response = requests.post(url, headers=headers, data=json.dumps(data))
+        return response.json()['accessToken']
+
+    # 利用post发送请求
+    def post_notification(self, msg):
+        token = self.get_token()
+        url = f"http://10.159.44.180/api/rest/device/{device_id}/notification"
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-type": "application/json",
+        }
+
+        res = requests.post(url, headers=headers, data=json.dumps(msg))
+        timestamp = res.json()['timestamp']
+        # print(res.json())
+        return timestamp
 
     # 发送消息   一直监控消息队列
     def send_notification(self):
         while need_send_to_device_hive:
             msg = need_send_to_device_hive.pop()
-            _ = self.device_hive_api.send_notification(device_id, msg['notification'], msg['parameters'])
-            # logging.info(msg['notification'], result.timestamp)
+            try:
+                self.post_notification(msg)
+            except Exception as e:
+                need_send_to_device_hive.append(msg)
+                error = {
+                    "notification": "error",
+                    "parameters": {
+                        "msg": str(e) + "发送错误"
+                    }
+                }
+                need_send_to_device_hive.append(error)
         threading.Timer(1, self.send_notification).start()
 
     # 监控命令线程
     def subscribe_command(self):
-        dh = DeviceHive(Device.ReceiverHandler)
-        dh.connect(self.rest_url, login=self.login, password=self.password)
+        try:
+            dh = DeviceHive(Device.ReceiverHandler)
+            dh.connect(self.rest_url, login=self.login, password=self.password)
+        except Exception as e:
+            msg = {
+                "notification": "error",
+                "parameters": {
+                    "msg": str(e)
+                }
+            }
+            need_send_to_device_hive.append(msg)
+            # 未知，待测试
+            self.subscribe_command()
 
 
 # 主线程激活opc服务
@@ -303,14 +354,15 @@ def eternal():
 
     # 监控连接状态
     while True:
+        print(threading.activeCount())
+        # print(threading.enumerate())
         time.sleep(5)
         # 配置文件更新重启订阅，  在所有发送到ua的请求，如果配置文件更新都会出错，主要是为了结束订阅线程。
         if OPCScript.config_status == Status.CONFIG_UPDATE:
             print("配置文件更新，先取消订阅，再重新订阅节点")
             opc_server.unsubscribe_nodes()
             time.sleep(2)
-            opc = OPCScript()
-            opc.subscribe_nodes()
+            opc_server.subscribe_nodes()
             OPCScript.config_status = Status.CONFIG_NOT_CHANGE
 
         elif OPCScript.connect_status == Status.SUCCEED:
@@ -319,14 +371,13 @@ def eternal():
         elif OPCScript.connect_status == Status.FAILED:
             print("连接失败")
             # 重启订阅线程
-            opc = OPCScript()
-            opc.unsubscribe_nodes()
+            opc_server.unsubscribe_nodes()
             time.sleep(2)
-            opc.subscribe_nodes()
+            opc_server.subscribe_nodes()
 
 
 if __name__ == '__main__':
-    device_id = 'simple-example-device'
+    device_id = 'r3GKj5VBtVE3WqdAxqtDzbe39pSIMBpNerAO'
     # 需要徐上传到平台的 msg opc订阅线程负责追加，device_hive上传线程负责上传
     need_send_to_device_hive = []
     # 需要执行的命令 ， device订阅线程负责追加， opc read线程负责上传
