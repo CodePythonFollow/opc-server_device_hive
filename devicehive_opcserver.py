@@ -5,8 +5,8 @@ import queue
 import threading
 import time
 from enum import Enum
+from json import JSONDecodeError
 import requests
-from devicehive import Handler, DeviceHive
 from opcua import Client, ua
 from opcua.client.ua_client import UASocketClient
 from opcua.ua.uaerrors import BadTypeMismatch
@@ -40,7 +40,7 @@ class OPCScript(UASocketClient):
                     "timestamp": str(source_times_tamp)
                 }
             }
-            print(msg)
+            # print(msg)
             # 1、维护一个消息队列，这里发送一个消息让devicehive进行处理
             need_send_to_device_hive.put(msg)
 
@@ -162,9 +162,10 @@ class OPCScript(UASocketClient):
     def read_device_hive_msg(self):
         while not need_achieve_commands.empty():
             command = need_achieve_commands.get()
-            command_dic = command.parameters
+            command_dic = command['parameters']
             try:
                 data = command_dic["data"]
+                # print(data)
                 error = []
                 for node in data:
                     node_id = node["nodeId"]
@@ -199,17 +200,20 @@ class OPCScript(UASocketClient):
                 # OPCScript.client.disconnect()
                 if not error:
                     result = {'result': 'Succeed'}
+                    status = 200
                 else:
                     error_msg = ''
                     for e in error:
                         error_msg += 'error :' + str(e) + '\n'
                     result = {"error": error}
-                command.result = result
-                command.save()
+                    status = 300
+                command['result'] = result
+                command['status'] = status
             except Exception as e:
-                command.result = {"error": str(e)}
-                command.save()
-        threading.Timer(1, self.read_device_hive_msg).start()
+                command['result'] = {"error": str(e)}
+                command['status'] = 300
+            need_update_commands.put(command)
+        threading.Timer(5, self.read_device_hive_msg).start()
 
     # 每隔5秒发送一次连接状态   线程
     def exchange_connect_status(self):
@@ -229,7 +233,9 @@ class OPCScript(UASocketClient):
             "parameters": {
                 "status": submit_status,
                 "timestamp": source_times_tamp,
-                "connectType": "opc ua"
+                "connectType": "opc ua",
+                "processStatus": True if (threading.activeCount() >= 7 and submit_status == 1)
+                            or (threading.activeCount() >= 5 and submit_status == 0) else False
             }
         }
         need_send_to_device_hive.put(msg)
@@ -238,23 +244,6 @@ class OPCScript(UASocketClient):
 
 # device hive 平台对象
 class Device:
-    # device hive 监听平台传递过来的命令
-    class ReceiverHandler(Handler):
-
-        def __init__(self, api):
-            Handler.__init__(self, api)
-            self._device_id = DeviceId
-            self._accept_command_name = accept_command_name
-            self.device = None
-
-        # 订阅含有update的语句
-        def handle_connect(self):
-            self.device = self.api.get_device(self._device_id)
-            self.device.subscribe_insert_commands([self._accept_command_name])
-
-        # 需要将收到的command 交给opc处理并且 得到结果返回给status
-        def handle_command_insert(self, command):
-            need_achieve_commands.put(command)
 
     def __init__(self):
         self.rest_url = f'http://{PlatformIp}/api/rest'
@@ -270,6 +259,7 @@ class Device:
             "password": Password
         }
         response = requests.post(self.token_url, headers=headers, data=json.dumps(data))
+        # response.
         return response.json()['accessToken']
 
     # 利用post发送请求
@@ -287,39 +277,76 @@ class Device:
     # 发送消息   一直监控消息队列
     def send_notification(self):
         while not need_send_to_device_hive.empty():
+            if need_send_to_device_hive.full():
+                print("队列满了, 清空队列。")
+                need_send_to_device_hive.queue.clear()
+                break
             msg = need_send_to_device_hive.get()
-            result = '发送错误: ' + str(msg['parameters'])
+            print(msg)
             try:
-                result = self.post_notification(msg)
+                self.post_notification(msg)
             # logging.info(msg['notification'], result.timestamp)
             except Exception as e:
+                time.sleep(2)
                 need_send_to_device_hive.put(msg)
-                error = {
-                    "notification": "error",
-                    "parameters": {
-                        "msg": str(e) + str(result)
-                    }
-                }
-                need_send_to_device_hive.put(error)
+                print("网络故障或者平台信息更改")
+                # need_send_to_device_hive.put(error)
         threading.Timer(1, self.send_notification).start()
 
-    # 监控命令线程
-    def subscribe_command(self):
+    # 监控命令线程  并更新命令
+    def get_commands(self):
         try:
-            dh = DeviceHive(Device.ReceiverHandler)
-            dh.connect(self.rest_url, login=Login, password=Password)
-        except Exception as e:
-            msg = {
-                "notification": "error",
-                "parameters": {
-                    "msg": str(e)
-                }
+            token = self.get_token()
+            url = f"http://{PlatformIp}/api/rest/device/{DeviceId}/command"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-type": "application/json",
             }
-            need_send_to_device_hive.put(msg)
-            # 未知，待测试,如果之后device断开发送了命令接收到了，或者接收不到，之后的接收到了就成功了
-            print("订阅线程关闭重启中")
+            response = requests.get(url, headers=headers)
+            if response.json():
+                for command in response.json():
+                    if command['status'] is None:
+                        # 已接受将status置为 100
+                        command['status'] = '100'
+                        self.update_commands(command)
+                        print('get')
+                        need_achieve_commands.put(command)
+        except Exception as e:
             time.sleep(5)
-            self.subscribe_command()
+            print("网络故障或者平台信息更改 命令获取错误")
+        while not need_update_commands.empty():
+            command = need_update_commands.get()
+            self.update_commands(command)
+        threading.Timer(5, self.get_commands).start()
+
+    # 命令执行完成后跟新
+    def update_commands(self, command):
+        try:
+            token = self.get_token()
+            url = f"http://{PlatformIp}/api/rest/device/{DeviceId}/command/{command['id']}"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-type": "application/json",
+            }
+            data = {
+                "status": command['status'],
+                "result": command['result']
+            }
+
+            res = requests.put(url, headers=headers, data=json.dumps(data))
+            # 网络问题， 命令过期几乎不可能
+            if res.status_code > 300:
+                #  发生此概率可能性太小
+                try:
+                    error = res.json()['error']
+                    print(error)
+                except JSONDecodeError:
+                    print("确定是网络问题")
+                    pass
+        except Exception as e:
+            time.sleep(5)
+            print("网络故障或者平台信息更改 命令更新错误，等待网络恢复重新更新")
+            need_update_commands.put(command)
 
 
 # 主线程激活opc服务
@@ -331,16 +358,16 @@ def eternal():
         # 开启订阅线程  默认
         opc_server.subscribe_nodes()
         time.sleep(3)
-        # 开启监控连接状态  1s
-        opc_server.exchange_connect_status()
         # 配置文件更新
-        opc_server.config_change()
+        # opc_server.config_change()
         # 开启平台订阅线程  默认
-        threading.Thread(target=device.subscribe_command).start()
-        # 开启处理命令线程  1s
+        device.get_commands()
+        # 开启处理命令线程  5s
         opc_server.read_device_hive_msg()
         # 开启平台发送线程  1s
         device.send_notification()
+        # 开启监控连接状态  1s
+        opc_server.exchange_connect_status()
     except Exception as e:
         print(e)
 
@@ -364,22 +391,24 @@ def eternal():
             # 重启订阅线程
             opc_server.unsubscribe_nodes()
             time.sleep(2)
+            print("重启订阅")
             opc_server.subscribe_nodes()
-            OPCScript.connect_status = Status.SUCCEED
 
 
 if __name__ == '__main__':
     # 设备数据
-    DeviceId = 'simple-example-device'
+    DeviceId = 'r3GKj5VBtVE3WqdAxqtDzbe39pSIMBpNerAO'
     PlatformIp = '10.159.44.180'
     Login = 'ctqUser'
     Password = 'program111'
     accept_command_name = 'update'
 
     # 需要徐上传到平台的 msg opc订阅线程负责追加，device_hive上传线程负责上传
-    need_send_to_device_hive = queue.Queue()
+    need_send_to_device_hive = queue.Queue(maxsize=100)
     # 需要执行的命令 ， device订阅线程负责追加， opc read线程负责上传
     need_achieve_commands = queue.Queue()
+    # 执行完需要更新命令状态
+    need_update_commands = queue.Queue()
 
     # 初始化，激活所有线程
     eternal()
